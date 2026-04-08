@@ -1,61 +1,126 @@
 # Git Audio Summary
 
-Tägliche Audio-Zusammenfassungen deines Git-Repos – direkt auf Telegram.
+macOS-only automation for a daily German audio briefing about a Git repository.
 
-## Was macht das?
+Every evening the system can send two Telegram audio messages:
 
-Jeden Abend um 22:00 Uhr bekommst du **zwei Audio-Nachrichten** auf Telegram:
+1. A daily change summary for the last 24 hours
+2. A full architecture summary for the whole repository
 
-1. **Tages-Update** (~2-3 Min) – Was hat sich in den letzten 24h geändert?
-2. **Architektur-Analyse** (~5-7 Min) – Wie ist das Repo aufgebaut? Wie hängt alles zusammen?
+The runtime is designed to stay local:
 
-## Tech-Stack (100% kostenlos)
+- Ollama for the LLM
+- Local fallback model chain
+- `edge-tts` for text-to-speech
+- Telegram for delivery
+- macOS LaunchAgents for scheduling
 
-- **LLM:** Ollama + Gemma 4 E4B (lokal, ~8GB RAM)
-- **TTS:** edge-tts (Microsoft Edge Stimmen, kein API-Key nötig)
-- **Zustellung:** Telegram Bot
-- **Scheduling:** macOS LaunchAgent (Cron-Alternative)
+## What changed in this version
 
-## Voraussetzungen
+- Cross-platform-safe repository scan using Python instead of GNU `find`
+- Cached repository index for the full architecture analysis
+- Automatic model fallback chain
+- Retries and fallback text delivery for Telegram failures
+- A committed `run_summary.sh` wrapper with `daily`, `full`, `both`, and `doctor`
+- Separate login catch-up handling if the Mac slept through the scheduled run
+- JSON status files plus dedicated stdout and stderr logs per run
 
-- macOS mit Python 3
-- [Ollama](https://ollama.com/download) installiert
-- Telegram auf dem Handy
+## Requirements
+
+- macOS
+- Python 3.10+
+- Git
+- Ollama installed and usable from the shell
+- Telegram account for the bot delivery
 
 ## Setup
+
+Run this once on the Mac that should execute the automation:
 
 ```bash
 bash setup.sh
 ```
 
-Das Setup-Skript führt dich interaktiv durch alles:
-- Installiert Python-Pakete
-- Lädt das Gemma 4 Modell herunter
-- Hilft beim Telegram Bot einrichten
-- Erstellt den täglichen Cronjob
+`setup.sh` will:
 
-## Nutzung
+- install missing Python packages
+- ensure the configured Ollama models are available
+- ask for Telegram bot token and chat id
+- write a safely quoted `.env`
+- install a scheduled LaunchAgent for the nightly run
+- install a login LaunchAgent that performs exactly one catch-up run if needed
+- run `doctor` at the end
+
+## Main entrypoint
+
+Use the committed wrapper:
 
 ```bash
-# Beide Zusammenfassungen
-bash run_summary.sh
-
-# Nur Tages-Update
-bash run_summary.sh daily
-
-# Nur Architektur-Analyse
-bash run_summary.sh full
+bash run_summary.sh both
 ```
 
-## Konfiguration
+Supported modes:
 
-Nach dem Setup liegt eine `.env` Datei im Ordner:
+- `bash run_summary.sh daily`
+- `bash run_summary.sh full`
+- `bash run_summary.sh both`
+- `bash run_summary.sh doctor`
 
+The wrapper also supports an internal `catchup-check` mode used by the login LaunchAgent.
+
+## Configuration
+
+The setup writes `.env` with quoted values so paths with spaces stay safe.
+
+Important keys:
+
+```bash
+REPO_PATH='/Users/you/example-repo'
+PRIMARY_MODEL='gemma4:e4b'
+FALLBACK_MODELS='gemma3:4b,qwen2.5:7b'
+OLLAMA_URL='http://localhost:11434/api/generate'
+TELEGRAM_BOT_TOKEN='...'
+TELEGRAM_CHAT_ID='...'
+TTS_VOICE='de-DE-ConradNeural'
+OUTPUT_DIR='/path/to/audio_output'
+CACHE_DIR='/path/to/cache'
+LOG_DIR='/path/to/logs'
+STATUS_DIR='/path/to/logs/status'
+HOURS_BACK='24'
+RUN_HOUR='22'
+RUN_MINUTE='0'
+MAX_DIFF_CHARS='12000'
+TELEGRAM_SEND_RETRIES='3'
+OLLAMA_START_TIMEOUT='30'
 ```
-REPO_PATH=/pfad/zu/deinem/repo
-OLLAMA_MODEL=gemma4:e4b
-TELEGRAM_BOT_TOKEN=dein-token
-TELEGRAM_CHAT_ID=deine-id
-TTS_VOICE=de-DE-ConradNeural
-HOURS_BACK=24
-```
+
+## Logs and status files
+
+Each wrapper run writes:
+
+- one stdout log file in `logs/`
+- one stderr log file in `logs/`
+- one JSON status file in `logs/status/`
+
+The cached repository index for the full analysis is stored in `cache/repo_index.json`.
+
+## Doctor mode
+
+`doctor` performs non-destructive diagnostics for:
+
+- Python packages
+- repository path and git access
+- write permissions for runtime directories
+- Ollama HTTP reachability
+- configured model availability
+- Telegram bot and chat configuration
+- local TTS generation
+- LaunchAgent presence
+
+It does not send Telegram messages.
+
+## Notes
+
+- The full architecture analysis is generated daily, not weekly.
+- If Telegram audio upload fails, the system keeps the local MP3 and tries a Telegram text fallback.
+- If the Mac was asleep at the planned time, the login LaunchAgent triggers one catch-up run on the next login.

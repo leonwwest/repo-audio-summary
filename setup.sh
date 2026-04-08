@@ -1,182 +1,255 @@
 #!/bin/bash
-# ============================================================
-# Setup-Skript für Git Audio Summary
-# Führe dieses Skript einmal aus: bash setup.sh
-# ============================================================
 
-set -e
+set -euo pipefail
 
-echo "🚀 Git Audio Summary – Setup"
-echo "================================"
-echo ""
-
-# ---- 1. Python-Abhängigkeiten installieren ----
-echo "📦 Installiere Python-Pakete..."
-pip3 install edge-tts requests
-echo "✅ Python-Pakete installiert"
-echo ""
-
-# ---- 2. Ollama prüfen ----
-if command -v ollama &> /dev/null; then
-    echo "✅ Ollama ist bereits installiert"
-else
-    echo "📥 Ollama muss installiert werden."
-    echo "   Gehe zu: https://ollama.com/download"
-    echo "   Oder installiere per Homebrew: brew install ollama"
-    echo ""
-    read -p "Drücke Enter wenn Ollama installiert ist..."
-fi
-
-# ---- 3. Gemma 4 Modell herunterladen ----
-echo ""
-echo "📥 Lade Gemma 4 E4B Modell herunter (ca. 5GB, einmalig)..."
-ollama pull gemma4:e4b
-echo "✅ Modell heruntergeladen"
-echo ""
-
-# ---- 4. Telegram Bot Setup ----
-echo "🤖 TELEGRAM BOT SETUP"
-echo "================================"
-echo ""
-echo "Folge diesen Schritten:"
-echo ""
-echo "1. Öffne Telegram und suche nach @BotFather"
-echo "2. Sende: /newbot"
-echo "3. Gib deinem Bot einen Namen, z.B.: 'Git Summary Bot'"
-echo "4. Gib einen Username, z.B.: 'mein_git_summary_bot'"
-echo "5. Du bekommst einen API Token – kopiere ihn!"
-echo ""
-read -p "Gib deinen Bot Token ein: " BOT_TOKEN
-echo ""
-echo "6. Öffne deinen neuen Bot in Telegram und sende ihm: /start"
-echo "7. Dann öffne diese URL im Browser:"
-echo "   https://api.telegram.org/bot${BOT_TOKEN}/getUpdates"
-echo "8. Suche nach 'chat':{'id': XXXXXXXXX} – das ist deine Chat-ID"
-echo ""
-read -p "Gib deine Chat-ID ein: " CHAT_ID
-echo ""
-
-# ---- 5. Repo-Pfad ----
-echo "Standard-Repo: ~/example-repo"
-read -p "Gib den Pfad zu deinem Git-Repo ein (Enter für Standard): " REPO_PATH
-REPO_PATH="${REPO_PATH:-$HOME/example-repo}"
-echo ""
-
-# ---- 6. .env Datei erstellen ----
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
-
-cat > "$ENV_FILE" << EOF
-# Git Audio Summary – Konfiguration
-REPO_PATH=${REPO_PATH}
-OLLAMA_MODEL=gemma4:e4b
-OLLAMA_URL=http://localhost:11434/api/generate
-TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
-TELEGRAM_CHAT_ID=${CHAT_ID}
-TTS_VOICE=de-DE-ConradNeural
-OUTPUT_DIR=${SCRIPT_DIR}/audio_output
-HOURS_BACK=24
-EOF
-
-echo "✅ Konfiguration gespeichert in: ${ENV_FILE}"
-echo ""
-
-# ---- 7. Runner-Skript erstellen ----
 RUNNER="${SCRIPT_DIR}/run_summary.sh"
-cat > "$RUNNER" << 'RUNNER_EOF'
-#!/bin/bash
-# Lädt die .env und startet das Skript
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+CACHE_DIR="${SCRIPT_DIR}/cache"
+OUTPUT_DIR="${SCRIPT_DIR}/audio_output"
+STATUS_DIR="${LOG_DIR}/status"
+DAILY_PLIST="${HOME}/Library/LaunchAgents/com.gitaudiosummary.daily.plist"
+CATCHUP_PLIST="${HOME}/Library/LaunchAgents/com.gitaudiosummary.catchup.plist"
 
-# .env laden
-set -a
-source "${SCRIPT_DIR}/.env"
-set +a
-
-# Ollama starten falls nicht läuft
-if ! pgrep -x "ollama" > /dev/null; then
-    ollama serve &
-    sleep 3
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "This setup script is intended for macOS."
+    exit 1
 fi
 
-# Modus: "daily", "full", oder "both" (Standard)
-MODE="${1:-both}"
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Missing required command: $1"
+        exit 1
+    fi
+}
 
-# Skript ausführen
-python3 "${SCRIPT_DIR}/repo_audio_summary.py" "$MODE"
-RUNNER_EOF
+python_has_module() {
+    python3 - "$1" <<'PY'
+import importlib.util
+import sys
 
-chmod +x "$RUNNER"
-echo "✅ Runner-Skript erstellt: ${RUNNER}"
-echo ""
+name = sys.argv[1]
+print("yes" if importlib.util.find_spec(name) else "no")
+PY
+}
 
-# ---- 8. LaunchAgent erstellen (macOS Cron-Alternative) ----
-PLIST_NAME="com.gitaudiosummary.daily"
-PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
+quote_env() {
+    python3 - "$1" <<'PY'
+import sys
 
-cat > "$PLIST_PATH" << PLIST_EOF
+value = sys.argv[1]
+print("'" + value.replace("'", "'\"'\"'") + "'")
+PY
+}
+
+read_existing_env() {
+    if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        source "${ENV_FILE}"
+        set +a
+    fi
+}
+
+install_python_module_if_missing() {
+    local module_name="$1"
+    local package_name="$2"
+    if [[ "$(python_has_module "${module_name}")" == "yes" ]]; then
+        echo "Python module ${package_name} already installed."
+        return 0
+    fi
+    echo "Installing Python package ${package_name}..."
+    python3 -m pip install "${package_name}"
+}
+
+pull_model_if_missing() {
+    local model_name="$1"
+    if ollama list | grep -Fq "${model_name}"; then
+        echo "Ollama model ${model_name} already available."
+        return 0
+    fi
+    echo "Pulling Ollama model ${model_name}..."
+    ollama pull "${model_name}"
+}
+
+write_env_file() {
+    cat > "${ENV_FILE}" <<EOF
+# Git Audio Summary configuration
+REPO_PATH=$(quote_env "${REPO_PATH}")
+PRIMARY_MODEL=$(quote_env "${PRIMARY_MODEL}")
+FALLBACK_MODELS=$(quote_env "${FALLBACK_MODELS}")
+OLLAMA_URL=$(quote_env "${OLLAMA_URL}")
+TELEGRAM_BOT_TOKEN=$(quote_env "${TELEGRAM_BOT_TOKEN}")
+TELEGRAM_CHAT_ID=$(quote_env "${TELEGRAM_CHAT_ID}")
+TTS_VOICE=$(quote_env "${TTS_VOICE}")
+OUTPUT_DIR=$(quote_env "${OUTPUT_DIR}")
+CACHE_DIR=$(quote_env "${CACHE_DIR}")
+LOG_DIR=$(quote_env "${LOG_DIR}")
+STATUS_DIR=$(quote_env "${STATUS_DIR}")
+HOURS_BACK=$(quote_env "${HOURS_BACK}")
+RUN_HOUR=$(quote_env "${RUN_HOUR}")
+RUN_MINUTE=$(quote_env "${RUN_MINUTE}")
+MAX_DIFF_CHARS=$(quote_env "${MAX_DIFF_CHARS}")
+TELEGRAM_SEND_RETRIES=$(quote_env "${TELEGRAM_SEND_RETRIES}")
+OLLAMA_START_TIMEOUT=$(quote_env "${OLLAMA_START_TIMEOUT}")
+EOF
+}
+
+write_launch_agents() {
+    mkdir -p "${HOME}/Library/LaunchAgents" "${LOG_DIR}" "${STATUS_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
+
+    cat > "${DAILY_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${PLIST_NAME}</string>
+    <string>com.gitaudiosummary.daily</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
         <string>${RUNNER}</string>
+        <string>both</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>22</integer>
+        <integer>${RUN_HOUR}</integer>
         <key>Minute</key>
-        <integer>0</integer>
+        <integer>${RUN_MINUTE}</integer>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
     <key>StandardOutPath</key>
-    <string>${SCRIPT_DIR}/logs/stdout.log</string>
+    <string>${LOG_DIR}/launchagent.daily.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>${SCRIPT_DIR}/logs/stderr.log</string>
-    <key>RunAtLoad</key>
-    <false/>
+    <string>${LOG_DIR}/launchagent.daily.stderr.log</string>
 </dict>
 </plist>
-PLIST_EOF
+EOF
 
-mkdir -p "${SCRIPT_DIR}/logs"
+    cat > "${CATCHUP_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gitaudiosummary.catchup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${RUNNER}</string>
+        <string>catchup-check</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/launchagent.catchup.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/launchagent.catchup.stderr.log</string>
+</dict>
+</plist>
+EOF
 
-# LaunchAgent laden
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
-launchctl load "$PLIST_PATH"
+    launchctl unload "${DAILY_PLIST}" >/dev/null 2>&1 || true
+    launchctl unload "${CATCHUP_PLIST}" >/dev/null 2>&1 || true
+    launchctl load "${DAILY_PLIST}"
+    launchctl load "${CATCHUP_PLIST}"
+}
 
-echo "✅ Täglicher Job eingerichtet: Jeden Abend um 22:00 Uhr"
-echo ""
+echo "Git Audio Summary setup for macOS"
+echo "================================="
 
-# ---- 9. Test ----
-echo "🧪 Möchtest du jetzt einen Test durchführen?"
-read -p "   (j/n): " DO_TEST
+require_command python3
+require_command git
+read_existing_env
 
-if [[ "$DO_TEST" == "j" || "$DO_TEST" == "J" ]]; then
-    echo ""
-    echo "🚀 Starte Test..."
-    bash "$RUNNER"
+REPO_PATH="${REPO_PATH:-${HOME}/example-repo}"
+PRIMARY_MODEL="${PRIMARY_MODEL:-gemma4:e4b}"
+FALLBACK_MODELS="${FALLBACK_MODELS:-gemma3:4b,qwen2.5:7b}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/generate}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+TTS_VOICE="${TTS_VOICE:-de-DE-ConradNeural}"
+HOURS_BACK="${HOURS_BACK:-24}"
+RUN_HOUR="${RUN_HOUR:-22}"
+RUN_MINUTE="${RUN_MINUTE:-0}"
+MAX_DIFF_CHARS="${MAX_DIFF_CHARS:-12000}"
+TELEGRAM_SEND_RETRIES="${TELEGRAM_SEND_RETRIES:-3}"
+OLLAMA_START_TIMEOUT="${OLLAMA_START_TIMEOUT:-30}"
+
+mkdir -p "${LOG_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}" "${STATUS_DIR}"
+chmod +x "${RUNNER}"
+
+install_python_module_if_missing "requests" "requests"
+install_python_module_if_missing "edge_tts" "edge-tts"
+
+if ! command -v ollama >/dev/null 2>&1; then
+    echo "Ollama is required. Install it from https://ollama.com/download or via Homebrew."
+    exit 1
 fi
 
-echo ""
-echo "================================"
-echo "✅ SETUP ABGESCHLOSSEN!"
-echo "================================"
-echo ""
-echo "📁 Alle Dateien liegen in: ${SCRIPT_DIR}"
-echo "🕙 Jeden Abend um 22:00 bekommst du ZWEI Audio-Zusammenfassungen auf Telegram:"
-echo "   📋 Tages-Update: Was hat sich heute geändert?"
-echo "   🏗️  Architektur: Wie hängt das ganze Repo zusammen?"
-echo ""
-echo "Nützliche Befehle:"
-echo "  Beide ausführen:    bash ${RUNNER}"
-echo "  Nur Tages-Update:   bash ${RUNNER} daily"
-echo "  Nur Architektur:    bash ${RUNNER} full"
-echo "  Job stoppen:        launchctl unload ${PLIST_PATH}"
-echo "  Job starten:        launchctl load ${PLIST_PATH}"
-echo "  Logs ansehen:       cat ${SCRIPT_DIR}/logs/stdout.log"
-echo ""
+echo
+echo "Telegram setup"
+echo "--------------"
+echo "1. Open Telegram and talk to @BotFather"
+echo "2. Create a bot with /newbot"
+echo "3. Start the new bot once"
+echo
+read -r -p "Telegram bot token [${TELEGRAM_BOT_TOKEN:-none}]: " INPUT_BOT_TOKEN
+if [[ -n "${INPUT_BOT_TOKEN}" ]]; then
+    TELEGRAM_BOT_TOKEN="${INPUT_BOT_TOKEN}"
+fi
+
+echo "Open this URL after starting the bot:"
+echo "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+read -r -p "Telegram chat id [${TELEGRAM_CHAT_ID:-none}]: " INPUT_CHAT_ID
+if [[ -n "${INPUT_CHAT_ID}" ]]; then
+    TELEGRAM_CHAT_ID="${INPUT_CHAT_ID}"
+fi
+
+echo
+read -r -p "Path to the repo to analyze [${REPO_PATH}]: " INPUT_REPO_PATH
+if [[ -n "${INPUT_REPO_PATH}" ]]; then
+    REPO_PATH="${INPUT_REPO_PATH}"
+fi
+
+read -r -p "Run hour [${RUN_HOUR}]: " INPUT_RUN_HOUR
+if [[ -n "${INPUT_RUN_HOUR}" ]]; then
+    RUN_HOUR="${INPUT_RUN_HOUR}"
+fi
+
+read -r -p "Run minute [${RUN_MINUTE}]: " INPUT_RUN_MINUTE
+if [[ -n "${INPUT_RUN_MINUTE}" ]]; then
+    RUN_MINUTE="${INPUT_RUN_MINUTE}"
+fi
+
+echo
+echo "Ensuring configured Ollama models are available..."
+pull_model_if_missing "${PRIMARY_MODEL}"
+OLD_IFS="${IFS}"
+IFS=',' read -r -a FALLBACK_MODELS_ARRAY <<< "${FALLBACK_MODELS}"
+IFS="${OLD_IFS}"
+for model in "${FALLBACK_MODELS_ARRAY[@]}"; do
+    model="$(echo "${model}" | xargs)"
+    if [[ -n "${model}" ]]; then
+        pull_model_if_missing "${model}"
+    fi
+done
+
+write_env_file
+write_launch_agents
+
+echo
+echo "Running doctor check..."
+bash "${RUNNER}" doctor
+
+echo
+echo "Setup complete."
+echo "Daily run:    bash ${RUNNER} both"
+echo "Daily only:   bash ${RUNNER} daily"
+echo "Full only:    bash ${RUNNER} full"
+echo "Doctor:       bash ${RUNNER} doctor"
+echo "Logs live in: ${LOG_DIR}"

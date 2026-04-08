@@ -4,6 +4,10 @@
 # Audio-Dateien (werden lokal generiert)
 audio_output/
 
+# Cache und Laufstatus
+cache/
+status/
+
 # Logs
 logs/
 
