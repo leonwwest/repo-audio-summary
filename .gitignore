@@ -1,0 +1,21 @@
+# Konfiguration mit Secrets
+.env
+
+# Audio-Dateien (werden lokal generiert)
+audio_output/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
