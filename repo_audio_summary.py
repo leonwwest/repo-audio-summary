@@ -54,6 +54,7 @@ EXCLUDED_DIR_NAMES = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".runtime",
     "coverage",
     "target",
     "out",
@@ -191,6 +192,7 @@ class Config:
     telegram_chat_id: str
     tts_voice: str
     output_dir: Path
+    text_output_dir: Path
     cache_dir: Path
     log_dir: Path
     status_dir: Path
@@ -210,6 +212,7 @@ class Config:
             if value.strip()
         ]
         output_dir = Path(os.environ.get("OUTPUT_DIR", str(base_dir / "audio_output"))).expanduser()
+        text_output_dir = Path(os.environ.get("TEXT_OUTPUT_DIR", str(output_dir / "transcripts"))).expanduser()
         cache_dir = Path(os.environ.get("CACHE_DIR", str(base_dir / "cache"))).expanduser()
         log_dir = Path(os.environ.get("LOG_DIR", str(base_dir / "logs"))).expanduser()
         status_dir = Path(os.environ.get("STATUS_DIR", str(log_dir / "status"))).expanduser()
@@ -222,6 +225,7 @@ class Config:
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
             tts_voice=os.environ.get("TTS_VOICE", "de-DE-ConradNeural"),
             output_dir=output_dir,
+            text_output_dir=text_output_dir,
             cache_dir=cache_dir,
             log_dir=log_dir,
             status_dir=status_dir,
@@ -319,7 +323,7 @@ def run_command(
 
 
 def ensure_runtime_directories(config: Config) -> None:
-    for directory in (config.output_dir, config.cache_dir, config.log_dir, config.status_dir):
+    for directory in (config.output_dir, config.text_output_dir, config.cache_dir, config.log_dir, config.status_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -440,7 +444,9 @@ def detect_entrypoints(files: list[Path], root: Path) -> list[str]:
         if rel in ENTRYPOINT_NAMES:
             entrypoints.append(rel)
             continue
-        if path.name in {"main.py", "main.ts", "main.js", "server.py", "app.py"}:
+        if path.name in {"main.py", "main.ts", "main.js", "server.py", "app.py"} and (
+            rel.count("/") == 0 or rel.startswith("src/")
+        ):
             entrypoints.append(rel)
     return sorted(set(entrypoints))
 
@@ -672,6 +678,136 @@ def build_architecture_model(index: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def classify_path_role(rel: str) -> str:
+    lower = rel.lower()
+    name = Path(rel).name.lower()
+    if name in {"package.json", "pyproject.toml", "requirements.txt", "dockerfile", "makefile"}:
+        return "config"
+    if lower.startswith(("src/ui/", "src/components/", "components/", "frontend/", "web/")):
+        return "frontend"
+    if lower.startswith(("src/api/", "api/", "backend/", "server/", "services/", "app/")):
+        return "backend"
+    if lower.startswith(("infra/", "terraform/", ".github/", "ops/", "deploy/", "k8s/")):
+        return "infrastructure"
+    if lower.startswith(("tests/", "test/", "__tests__/")):
+        return "tests"
+    if any(token in lower for token in ("config", "settings", ".env", "tsconfig", "vite.config", "next.config", "webpack")):
+        return "config"
+    return "core"
+
+
+def describe_project_shape(index: dict[str, Any]) -> list[str]:
+    roles = Counter(classify_path_role(rel) for rel in index["files"])
+    descriptions = []
+    if roles["frontend"]:
+        descriptions.append("Es gibt einen erkennbaren Frontend-Bereich.")
+    if roles["backend"]:
+        descriptions.append("Es gibt einen erkennbaren Backend- oder Service-Bereich.")
+    if roles["infrastructure"]:
+        descriptions.append("Es gibt Infrastruktur- oder Deploy-Konfiguration im Repo.")
+    if roles["tests"]:
+        descriptions.append("Es gibt einen separaten Testbereich.")
+    if not descriptions:
+        descriptions.append("Das Repo wirkt eher kompakt und ohne stark getrennte Schichten.")
+    return descriptions
+
+
+def prioritize_changed_files(changes: dict[str, Any], index: dict[str, Any]) -> list[dict[str, Any]]:
+    hotspots = {
+        item["file"]: item["score"]
+        for item in index.get("architecture_model", {}).get("hotspots", [])
+    }
+    entrypoints = set(index.get("entrypoints", []))
+    config_files = set(index.get("config_snippets", {}).keys())
+    changed_items = []
+
+    for line in changes["files_changed"].splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        parts = cleaned.split(maxsplit=1)
+        status = parts[0]
+        rel = parts[1] if len(parts) > 1 else parts[0]
+        score = 0
+        reasons: list[str] = []
+
+        if rel in entrypoints:
+            score += 8
+            reasons.append("Entrypoint")
+        if rel in config_files:
+            score += 7
+            reasons.append("Konfiguration")
+        hotspot_score = hotspots.get(rel, 0)
+        if hotspot_score:
+            score += min(hotspot_score, 6)
+            reasons.append("zentraler Hotspot")
+
+        role = classify_path_role(rel)
+        if role in {"frontend", "backend", "infrastructure"}:
+            score += 2
+            reasons.append(role)
+        if status.startswith("R"):
+            score += 3
+            reasons.append("Umbenennung")
+        elif status.startswith("D"):
+            score += 2
+            reasons.append("Loeschung")
+        else:
+            score += 1
+
+        changed_items.append(
+            {
+                "file": rel,
+                "status": status,
+                "score": score,
+                "role": role,
+                "reasons": reasons,
+            }
+        )
+
+    changed_items.sort(key=lambda item: (-item["score"], item["file"]))
+    return changed_items
+
+
+def summarize_priority_changes(changes: dict[str, Any], index: dict[str, Any]) -> str:
+    prioritized = prioritize_changed_files(changes, index)
+    if not prioritized:
+        return "Keine priorisierten Dateien erkannt."
+    lines = []
+    for item in prioritized[:12]:
+        reason_text = ", ".join(item["reasons"]) if item["reasons"] else "allgemeine Aenderung"
+        lines.append(f"- {item['file']} [{item['status']}] -> {reason_text}")
+    return "\n".join(lines)
+
+
+def summarize_transcript_metadata(metadata: dict[str, Any]) -> str:
+    lines = []
+    for key, value in metadata.items():
+        if value is None or value == "":
+            continue
+        lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def archive_summary_text(
+    config: Config,
+    *,
+    file_prefix: str,
+    summary_text: str,
+    metadata: dict[str, Any],
+) -> Path:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    text_path = config.text_output_dir / f"{file_prefix}_{timestamp}.txt"
+    payload = (
+        "Git Audio Summary Transcript\n"
+        "============================\n\n"
+        f"{summarize_transcript_metadata(metadata)}\n\n"
+        f"{summary_text}\n"
+    )
+    text_path.write_text(payload, encoding="utf-8")
+    return text_path
+
+
 def build_repo_index(config: Config) -> dict[str, Any]:
     files = collect_repo_files(config.repo_path)
     if not files:
@@ -729,6 +865,7 @@ def build_repo_index(config: Config) -> dict[str, Any]:
         "imports": imports,
         "external_dependencies": collect_external_dependencies(config_snippets),
         "external_modules": [name for name, _count in external_modules.most_common(30)],
+        "project_shape": describe_project_shape({"files": rel_files}),
     }
     index["architecture_model"] = build_architecture_model(index)
     return index
@@ -764,6 +901,7 @@ def load_or_build_repo_index(config: Config) -> tuple[dict[str, Any], bool]:
         cached["total_files"] = len(rel_files)
         cached["files"] = rel_files
         cached["directories"] = collect_directory_summary(files, config.repo_path)
+        cached["project_shape"] = cached.get("project_shape") or describe_project_shape({"files": rel_files})
         return cached, True
 
     index = build_repo_index(config)
@@ -778,22 +916,28 @@ def shorten(text: str, limit: int) -> str:
     return text[:limit] + "\n... (truncated)"
 
 
-def format_daily_prompt(changes: dict[str, Any], config: Config) -> str:
+def format_daily_prompt(changes: dict[str, Any], config: Config, index: dict[str, Any]) -> str:
+    prioritized_changes = summarize_priority_changes(changes, index)
     return f"""
 Du erstellst eine deutsche Audio-Zusammenfassung fuer einen Entwickler.
 
 Ziel:
 - erklaere die wichtigsten Aenderungen der letzten {config.hours_back} Stunden
 - verbinde Commits, Dateien und moegliche Motivation zu einer klaren Geschichte
+- gewichte zentrale Dateien staerker als Nebenaenderungen
 - nenne nur die wichtigsten Dateien
 - klinge wie eine kurze, natuerliche Sprachnachricht
 - keine Markdown-Syntax und keine Aufzaehlungszeichen
 - beginne mit "Hier ist deine taegliche Repo-Zusammenfassung."
 - ende mit einem kurzen Fazit
 - Umfang: etwa 250 bis 380 Woerter
+- trenne sichtbar bestaetigte Aenderungen von moeglicher Absicht; wenn du Motivation nur vermutest, sage das kurz als Vermutung
 
 Zeitraum:
 {changes["period"]}
+
+Priorisierte geaenderte Dateien:
+{prioritized_changes}
 
 Commit-Log:
 {changes["log"] or "(keine Commits)"}
@@ -837,6 +981,7 @@ Ziel:
 - gib einen echten Gesamtueberblick ueber Architektur, Verantwortlichkeiten und Zusammenhaenge
 - nenne nicht nur Dateilisten, sondern erklaere, wie die Teile miteinander arbeiten
 - markiere Vermutungen klar als Vermutung, wenn etwas nicht direkt sichtbar ist
+- benenne zuerst sichere Beobachtungen aus dem Code und trenne danach hoechstens wenige vorsichtige Hypothesen
 - klinge natuerlich, gesprochensprachlich und ohne Markdown oder Aufzaehlungszeichen
 - beginne mit "Willkommen zur Architektur-Analyse deines Repositories."
 - ende mit den wichtigsten Erkenntnissen und moeglichen Auffaelligkeiten
@@ -854,6 +999,7 @@ Repo-Struktur:
 - Verzeichnisse: {", ".join(index["directories"][:25])}
 - Dateitypen: {", ".join(f"{item['extension']}={item['count']}" for item in index["file_types"][:12])}
 - Entrypoints: {", ".join(index["entrypoints"][:12]) or "keine klaren Entrypoints gefunden"}
+- Projektform: {" ".join(index.get("project_shape", []))}
 
 Architekturmodell:
 Komponenten:
@@ -876,6 +1022,11 @@ Wichtige Konfigurationen:
 
 Wichtige Dateien:
 {shorten(key_files_text, 5000)}
+
+Ausgabe-Regeln:
+- Sage explizit, was aus dem Code sicher sichtbar ist.
+- Wenn du etwas nur aus Mustern ableitest, kuendige es mit "Meine Vermutung ist" an.
+- Vermeide konkrete Behauptungen ueber Laufzeitverhalten, wenn es dafuer in den Eingaben keinen klaren Beleg gibt.
 """.strip()
 
 
@@ -1014,25 +1165,43 @@ async def render_and_send_audio(
     summary_text: str,
     file_prefix: str,
     caption: str,
+    metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    timestamp = datetime.now().strftime("%Y-%m-%d")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     audio_path = config.output_dir / f"{file_prefix}_{timestamp}.mp3"
+    transcript_path = archive_summary_text(
+        config,
+        file_prefix=file_prefix,
+        summary_text=summary_text,
+        metadata=metadata,
+    )
     await generate_audio(summary_text, audio_path, config.tts_voice)
+
+    compact_caption_parts = [caption]
+    if metadata.get("model"):
+        compact_caption_parts.append(f"Modell: {metadata['model']}")
+    if "cache_used" in metadata:
+        compact_caption_parts.append(f"Cache: {'ja' if metadata['cache_used'] else 'nein'}")
+    if metadata.get("run_kind"):
+        compact_caption_parts.append(f"Run: {metadata['run_kind']}")
+    final_caption = " | ".join(compact_caption_parts)
 
     result = {
         "audio_path": str(audio_path),
-        "caption": caption,
+        "transcript_path": str(transcript_path),
+        "caption": final_caption,
         "telegram_audio_sent": False,
         "telegram_text_fallback": False,
     }
     try:
-        send_telegram_audio(config, audio_path, caption)
+        send_telegram_audio(config, audio_path, final_caption)
         result["telegram_audio_sent"] = True
     except SummaryError as exc:
         recorder.add_warning(str(exc))
         fallback = (
-            f"{caption}\n\nDer Audio-Versand ist fehlgeschlagen. "
-            f"Die Datei liegt lokal unter: {audio_path}\n\n"
+            f"{final_caption}\n\nDer Audio-Versand ist fehlgeschlagen. "
+            f"Die Datei liegt lokal unter: {audio_path}\n"
+            f"Das Textarchiv liegt unter: {transcript_path}\n\n"
             f"Kurzfassung:\n{summary_text[:3500]}"
         )
         try:
@@ -1046,11 +1215,12 @@ async def render_and_send_audio(
 
 async def run_daily_summary(config: Config, runner: ModelRunner, recorder: RunRecorder) -> dict[str, Any]:
     changes = get_git_changes(config)
+    index, cache_used = load_or_build_repo_index(config)
     if changes["commit_count"] == 0:
         summary = DEFAULT_DAILY_NO_CHANGE
         model_used = None
     else:
-        prompt = format_daily_prompt(changes, config)
+        prompt = format_daily_prompt(changes, config, index)
         summary, model_used = runner.generate(prompt, max_tokens=700, timeout=180, purpose="daily")
     caption = (
         f"Daily Update {datetime.now().strftime('%d.%m.%Y')}\n"
@@ -1060,7 +1230,9 @@ async def run_daily_summary(config: Config, runner: ModelRunner, recorder: RunRe
         "period": changes["period"],
         "commit_count": changes["commit_count"],
         "model": model_used,
+        "cache_used": cache_used,
         "summary_preview": summary[:500],
+        "top_changes": prioritize_changed_files(changes, index)[:5],
     }
     await render_and_send_audio(
         config,
@@ -1069,6 +1241,13 @@ async def run_daily_summary(config: Config, runner: ModelRunner, recorder: RunRe
         summary_text=summary,
         file_prefix="daily",
         caption=caption,
+        metadata={
+            "mode": "daily",
+            "model": model_used or "kein Modell benoetigt",
+            "cache_used": cache_used,
+            "run_kind": os.environ.get("GAS_RUN_KIND", "manual"),
+            "commit_count": changes["commit_count"],
+        },
     )
     recorder.set_result("daily", result)
     return result
@@ -1096,6 +1275,14 @@ async def run_full_summary(config: Config, runner: ModelRunner, recorder: RunRec
         summary_text=summary,
         file_prefix="architecture",
         caption=caption,
+        metadata={
+            "mode": "full",
+            "model": model_used,
+            "cache_used": cache_used,
+            "run_kind": os.environ.get("GAS_RUN_KIND", "manual"),
+            "head_sha": index["git"]["head_sha"],
+            "total_files": index["total_files"],
+        },
     )
     recorder.set_result("full", result)
     return result
@@ -1115,6 +1302,7 @@ async def run_doctor(config: Config, recorder: RunRecorder) -> int:
     edge_tts_installed = module_status("edge_tts")
 
     add_check("python3", sys.version_info >= (3, 10), sys.version.replace("\n", " "), True)
+    add_check("pip", shutil.which("pip3") is not None or shutil.which("pip") is not None, "pip available in PATH", False)
     add_check("requests", requests_installed, "installed" if requests_installed else "missing", True)
     add_check("edge_tts", edge_tts_installed, "installed" if edge_tts_installed else "missing", True)
     add_check("repo_path", config.repo_path.exists(), str(config.repo_path), True)

@@ -1,0 +1,8 @@
+{
+  "name": "sample-repo",
+  "version": "1.0.0",
+  "dependencies": {
+    "react": "^18.0.0",
+    "axios": "^1.7.0"
+  }
+}

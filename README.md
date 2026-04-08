@@ -21,9 +21,11 @@ The runtime is designed to stay local:
 - Cached repository index for the full architecture analysis
 - Automatic model fallback chain
 - Retries and fallback text delivery for Telegram failures
+- Local `.txt` transcript archive for every generated summary
 - A committed `run_summary.sh` wrapper with `daily`, `full`, `both`, and `doctor`
 - Separate login catch-up handling if the Mac slept through the scheduled run
 - JSON status files plus dedicated stdout and stderr logs per run
+- Fixture-based tests for repo indexing, cache reuse, and change prioritization
 
 ## Requirements
 
@@ -50,6 +52,7 @@ bash setup.sh
 - install a scheduled LaunchAgent for the nightly run
 - install a login LaunchAgent that performs exactly one catch-up run if needed
 - run `doctor` at the end
+- optionally run an immediate smoke test
 
 ## Main entrypoint
 
@@ -86,6 +89,7 @@ OUTPUT_DIR='/path/to/audio_output'
 CACHE_DIR='/path/to/cache'
 LOG_DIR='/path/to/logs'
 STATUS_DIR='/path/to/logs/status'
+TEXT_OUTPUT_DIR='/path/to/audio_output/transcripts'
 HOURS_BACK='24'
 RUN_HOUR='22'
 RUN_MINUTE='0'
@@ -101,6 +105,7 @@ Each wrapper run writes:
 - one stdout log file in `logs/`
 - one stderr log file in `logs/`
 - one JSON status file in `logs/status/`
+- one `.txt` transcript in `audio_output/transcripts/`
 
 The cached repository index for the full analysis is stored in `cache/repo_index.json`.
 
@@ -116,11 +121,29 @@ The cached repository index for the full analysis is stored in `cache/repo_index
 - Telegram bot and chat configuration
 - local TTS generation
 - LaunchAgent presence
+- basic pip availability
 
 It does not send Telegram messages.
 
 ## Notes
 
 - The full architecture analysis is generated daily, not weekly.
+- Daily summaries now prioritize entrypoints, config files, and architectural hotspots.
+- Architecture prompts explicitly separate visible facts from cautious hypotheses.
 - If Telegram audio upload fails, the system keeps the local MP3 and tries a Telegram text fallback.
 - If the Mac was asleep at the planned time, the login LaunchAgent triggers one catch-up run on the next login.
+
+## Tests
+
+There is a small fixture repository plus unittest coverage for:
+
+- repository indexing and import detection
+- cache reuse
+- changed-file prioritization
+- transcript archiving
+
+Run with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

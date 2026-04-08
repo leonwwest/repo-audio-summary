@@ -8,6 +8,7 @@ RUNNER="${SCRIPT_DIR}/run_summary.sh"
 LOG_DIR="${SCRIPT_DIR}/logs"
 CACHE_DIR="${SCRIPT_DIR}/cache"
 OUTPUT_DIR="${SCRIPT_DIR}/audio_output"
+TEXT_OUTPUT_DIR="${OUTPUT_DIR}/transcripts"
 STATUS_DIR="${LOG_DIR}/status"
 DAILY_PLIST="${HOME}/Library/LaunchAgents/com.gitaudiosummary.daily.plist"
 CATCHUP_PLIST="${HOME}/Library/LaunchAgents/com.gitaudiosummary.catchup.plist"
@@ -20,6 +21,18 @@ fi
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "Missing required command: $1"
+        exit 1
+    fi
+}
+
+ensure_pip_available() {
+    if python3 -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "python3 -m pip is missing. Trying ensurepip..."
+    python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+        echo "pip is still unavailable. Please install Python with pip support."
         exit 1
     fi
 }
@@ -83,6 +96,7 @@ TELEGRAM_BOT_TOKEN=$(quote_env "${TELEGRAM_BOT_TOKEN}")
 TELEGRAM_CHAT_ID=$(quote_env "${TELEGRAM_CHAT_ID}")
 TTS_VOICE=$(quote_env "${TTS_VOICE}")
 OUTPUT_DIR=$(quote_env "${OUTPUT_DIR}")
+TEXT_OUTPUT_DIR=$(quote_env "${TEXT_OUTPUT_DIR}")
 CACHE_DIR=$(quote_env "${CACHE_DIR}")
 LOG_DIR=$(quote_env "${LOG_DIR}")
 STATUS_DIR=$(quote_env "${STATUS_DIR}")
@@ -96,7 +110,7 @@ EOF
 }
 
 write_launch_agents() {
-    mkdir -p "${HOME}/Library/LaunchAgents" "${LOG_DIR}" "${STATUS_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}"
+    mkdir -p "${HOME}/Library/LaunchAgents" "${LOG_DIR}" "${STATUS_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}" "${TEXT_OUTPUT_DIR}"
 
     cat > "${DAILY_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -164,6 +178,8 @@ echo "================================="
 
 require_command python3
 require_command git
+require_command bash
+ensure_pip_available
 read_existing_env
 
 REPO_PATH="${REPO_PATH:-${HOME}/example-repo}"
@@ -173,6 +189,7 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/generate}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 TTS_VOICE="${TTS_VOICE:-de-DE-ConradNeural}"
+TEXT_OUTPUT_DIR="${TEXT_OUTPUT_DIR:-${OUTPUT_DIR}/transcripts}"
 HOURS_BACK="${HOURS_BACK:-24}"
 RUN_HOUR="${RUN_HOUR:-22}"
 RUN_MINUTE="${RUN_MINUTE:-0}"
@@ -180,7 +197,7 @@ MAX_DIFF_CHARS="${MAX_DIFF_CHARS:-12000}"
 TELEGRAM_SEND_RETRIES="${TELEGRAM_SEND_RETRIES:-3}"
 OLLAMA_START_TIMEOUT="${OLLAMA_START_TIMEOUT:-30}"
 
-mkdir -p "${LOG_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}" "${STATUS_DIR}"
+mkdir -p "${LOG_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}" "${TEXT_OUTPUT_DIR}" "${STATUS_DIR}"
 chmod +x "${RUNNER}"
 
 install_python_module_if_missing "requests" "requests"
@@ -190,6 +207,7 @@ if ! command -v ollama >/dev/null 2>&1; then
     echo "Ollama is required. Install it from https://ollama.com/download or via Homebrew."
     exit 1
 fi
+echo "Using Ollama: $(ollama --version 2>/dev/null || echo 'version unknown')"
 
 echo
 echo "Telegram setup"
@@ -245,6 +263,12 @@ write_launch_agents
 echo
 echo "Running doctor check..."
 bash "${RUNNER}" doctor
+
+echo
+read -r -p "Run an immediate smoke test now? [y/N]: " RUN_SMOKE_TEST
+if [[ "${RUN_SMOKE_TEST}" == "y" || "${RUN_SMOKE_TEST}" == "Y" ]]; then
+    bash "${RUNNER}" both
+fi
 
 echo
 echo "Setup complete."

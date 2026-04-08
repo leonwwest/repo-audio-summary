@@ -16,6 +16,7 @@ source "${ENV_FILE}"
 set +a
 
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/audio_output}"
+TEXT_OUTPUT_DIR="${TEXT_OUTPUT_DIR:-${OUTPUT_DIR}/transcripts}"
 CACHE_DIR="${CACHE_DIR:-${SCRIPT_DIR}/cache}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 STATUS_DIR="${STATUS_DIR:-${LOG_DIR}/status}"
@@ -23,7 +24,7 @@ RUN_HOUR="${RUN_HOUR:-22}"
 RUN_MINUTE="${RUN_MINUTE:-0}"
 OLLAMA_START_TIMEOUT="${OLLAMA_START_TIMEOUT:-30}"
 
-mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}" "${LOG_DIR}" "${STATUS_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${TEXT_OUTPUT_DIR}" "${CACHE_DIR}" "${LOG_DIR}" "${STATUS_DIR}"
 
 MODE="${1:-both}"
 STATE_FILE="${CACHE_DIR}/run_state.json"
@@ -68,10 +69,9 @@ elif command == "write_state":
     }
     state_file.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 elif command == "ollama_up":
-    import requests
-
     url = sys.argv[2]
     try:
+        import requests
         response = requests.get(url, timeout=3)
         ok = response.status_code == 200
     except Exception:
