@@ -5,6 +5,7 @@ Reliable daily Git audio summaries for macOS.
 Modes:
   - daily: summarize the last HOURS_BACK hours
   - full: build a repository-wide architecture summary
+  - deep: build a topic-specific deep-dive summary
   - both: run daily and full
   - doctor: run diagnostics without Telegram side effects
 """
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -176,6 +178,53 @@ DEFAULT_DAILY_NO_CHANGE = (
     "Tag im Repository. Die Architektur-Zusammenfassung kommt trotzdem wie geplant, "
     "damit du den Gesamtueberblick behaeltst."
 )
+
+TOPIC_STOP_WORDS = {
+    "aber",
+    "alles",
+    "also",
+    "analysis",
+    "analyse",
+    "bitte",
+    "das",
+    "deep",
+    "deine",
+    "deines",
+    "dem",
+    "den",
+    "der",
+    "des",
+    "die",
+    "dies",
+    "dive",
+    "durch",
+    "eine",
+    "einem",
+    "einen",
+    "einer",
+    "eines",
+    "einfach",
+    "entrypoint",
+    "fuer",
+    "genau",
+    "im",
+    "ist",
+    "mit",
+    "nach",
+    "oder",
+    "repo",
+    "repository",
+    "spezifisch",
+    "the",
+    "thema",
+    "topic",
+    "und",
+    "von",
+    "was",
+    "wie",
+    "zum",
+    "zur",
+}
 
 
 class SummaryError(RuntimeError):
@@ -916,6 +965,249 @@ def shorten(text: str, limit: int) -> str:
     return text[:limit] + "\n... (truncated)"
 
 
+def normalize_text_for_match(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def extract_topic_terms(topic: str) -> list[str]:
+    terms = []
+    for token in normalize_text_for_match(topic).split():
+        if len(token) < 3:
+            continue
+        if token in TOPIC_STOP_WORDS:
+            continue
+        terms.append(token)
+    return list(dict.fromkeys(terms))
+
+
+def topic_match_score(text: str, terms: list[str]) -> int:
+    haystack = normalize_text_for_match(text)
+    if not haystack:
+        return 0
+    score = 0
+    for term in terms:
+        if term in haystack:
+            score += 2 if len(term) >= 6 else 1
+    return score
+
+
+def sanitize_topic_slug(topic: str) -> str:
+    slug = normalize_text_for_match(topic).replace(" ", "-")
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug[:48] or "topic"
+
+
+def resolve_deep_dive_topic(cli_args: list[str]) -> str:
+    if cli_args:
+        topic = " ".join(cli_args).strip()
+        if topic:
+            return topic
+    return os.environ.get("DEEP_DIVE_TOPIC", "").strip()
+
+
+def build_incoming_import_map(index: dict[str, Any]) -> dict[str, list[str]]:
+    incoming: dict[str, list[str]] = {}
+    for source, details in index.get("imports", {}).items():
+        for target in details.get("internal", []):
+            incoming.setdefault(target, []).append(source)
+    for target in incoming:
+        incoming[target] = sorted(set(incoming[target]))
+    return incoming
+
+
+def deep_dive_file_bias(rel: str) -> tuple[int, list[str]]:
+    lower = rel.lower()
+    suffix = Path(rel).suffix.lower()
+    score = 0
+    reasons: list[str] = []
+
+    if suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".ps1", ".sh", ".sql", ".yaml", ".yml", ".json", ".toml"}:
+        score += 5
+        reasons.append("ausfuehrbare oder konfigurierende Datei")
+    elif suffix in {".md", ".txt"}:
+        score -= 2
+        reasons.append("eher dokumentierend")
+
+    if any(token in lower for token in ("readme", "changelog", "worklog", "meeting", "email", "notiz", "notes")):
+        score -= 4
+        reasons.append("Doku statt Kernlogik")
+
+    return score, reasons
+
+
+def collect_topic_context(config: Config, index: dict[str, Any], topic: str) -> dict[str, Any]:
+    terms = extract_topic_terms(topic)
+    normalized_topic = normalize_text_for_match(topic)
+    architecture = index.get("architecture_model", {})
+    hotspot_scores = {
+        item["file"]: item["score"]
+        for item in architecture.get("hotspots", [])
+    }
+    incoming_map = build_incoming_import_map(index)
+
+    component_matches = []
+    for name, count in architecture.get("components", []):
+        score = topic_match_score(name, terms) * 4
+        if normalized_topic and normalized_topic in normalize_text_for_match(name):
+            score += 10
+        if score:
+            component_matches.append({"name": name, "count": count, "score": score})
+    component_matches.sort(key=lambda item: (-item["score"], item["name"]))
+    matched_components = {item["name"] for item in component_matches[:5]}
+
+    directory_matches = []
+    for directory in index.get("directories", []):
+        score = topic_match_score(directory, terms) * 4
+        if normalized_topic and normalized_topic in normalize_text_for_match(directory):
+            score += 12
+        if score:
+            directory_matches.append({"name": directory, "score": score})
+    directory_matches.sort(key=lambda item: (-item["score"], item["name"]))
+    matched_directories = [item["name"] for item in directory_matches[:8]]
+
+    candidates: list[dict[str, Any]] = []
+    for rel in index["files"]:
+        normalized_rel = normalize_text_for_match(rel)
+        component = rel.split("/", 1)[0] if "/" in rel else "(root)"
+        score = 0
+        reasons: list[str] = []
+
+        if normalized_topic and normalized_topic in normalized_rel:
+            score += 14
+            reasons.append("exakter Pfadbezug")
+
+        path_term_score = topic_match_score(rel, terms)
+        if path_term_score:
+            score += path_term_score * 3
+            reasons.append("Pfad passt zum Thema")
+
+        matching_directories = [
+            directory
+            for directory in matched_directories
+            if directory != "." and (rel == directory or rel.startswith(f"{directory}/"))
+        ]
+        if matching_directories:
+            score += 8
+            reasons.append(f"liegt in passendem Verzeichnis ({matching_directories[0]})")
+
+        if component in matched_components:
+            score += 5
+            reasons.append("liegt in passender Komponente")
+
+        if rel in index.get("entrypoints", []):
+            score += 2
+            reasons.append("Entrypoint")
+
+        hotspot_score = hotspot_scores.get(rel, 0)
+        if hotspot_score and score:
+            score += min(hotspot_score, 4)
+            reasons.append("architektonischer Hotspot")
+
+        bias_score, bias_reasons = deep_dive_file_bias(rel)
+        if bias_score:
+            score += bias_score
+            reasons.extend(bias_reasons)
+
+        if score:
+            candidates.append(
+                {
+                    "file": rel,
+                    "component": component,
+                    "role": classify_path_role(rel),
+                    "score": score,
+                    "content_score": 0,
+                    "reasons": reasons,
+                }
+            )
+
+    if not candidates:
+        for rel in index["files"]:
+            snippet = read_text_snippet(config.repo_path / rel, 2200)
+            score = topic_match_score(snippet, terms) * 2
+            if normalized_topic and normalized_topic in normalize_text_for_match(snippet):
+                score += 8
+            if score:
+                candidates.append(
+                    {
+                        "file": rel,
+                        "component": rel.split("/", 1)[0] if "/" in rel else "(root)",
+                        "role": classify_path_role(rel),
+                        "score": score,
+                        "content_score": score,
+                        "reasons": ["inhaltlicher Treffer"],
+                    }
+                )
+
+    for candidate in candidates[:24]:
+        snippet = read_text_snippet(config.repo_path / candidate["file"], 2200)
+        content_score = topic_match_score(snippet, terms) * 2
+        if normalized_topic and normalized_topic in normalize_text_for_match(snippet):
+            content_score += 8
+        if content_score:
+            candidate["score"] += content_score
+            candidate["content_score"] = content_score
+            candidate["reasons"] = [*candidate["reasons"], "Codeinhalt passt zum Thema"]
+
+    candidates.sort(key=lambda item: (-item["score"], item["file"]))
+    selected_candidates = candidates[:8]
+
+    file_details = []
+    selected_files = {item["file"] for item in selected_candidates}
+    for item in selected_candidates:
+        rel = item["file"]
+        imports = index.get("imports", {}).get(rel, {})
+        file_details.append(
+            {
+                **item,
+                "imports_out": imports.get("internal", [])[:6],
+                "imports_in": incoming_map.get(rel, [])[:6],
+                "snippet": shorten(read_text_snippet(config.repo_path / rel, 1800), 1200),
+            }
+        )
+
+    related_relationships = []
+    for relation in architecture.get("component_relationships", []):
+        if relation["from"] in matched_components or relation["to"] in matched_components:
+            related_relationships.append(relation)
+
+    related_configs = []
+    for name, content in index.get("config_snippets", {}).items():
+        score = topic_match_score(name, terms) * 3 + topic_match_score(content, terms)
+        if normalized_topic and normalized_topic in normalize_text_for_match(name):
+            score += 8
+        if score:
+            related_configs.append(
+                {
+                    "file": name,
+                    "score": score,
+                    "snippet": shorten(content, 900),
+                }
+            )
+    related_configs.sort(key=lambda item: (-item["score"], item["file"]))
+
+    matched_entrypoints = []
+    for item in architecture.get("entrypoint_dependencies", []):
+        touched = set(item.get("touches", []))
+        if item["entrypoint"] in selected_files or touched & selected_files:
+            matched_entrypoints.append(item)
+
+    coverage = "stark" if file_details else "schwach"
+    return {
+        "topic": topic,
+        "terms": terms,
+        "coverage": coverage,
+        "matched_components": component_matches[:5],
+        "matched_directories": directory_matches[:8],
+        "selected_files": file_details,
+        "related_relationships": related_relationships[:8],
+        "related_configs": related_configs[:5],
+        "matched_entrypoints": matched_entrypoints[:6],
+    }
+
+
 def format_daily_prompt(changes: dict[str, Any], config: Config, index: dict[str, Any]) -> str:
     prioritized_changes = summarize_priority_changes(changes, index)
     return f"""
@@ -1027,6 +1319,97 @@ Ausgabe-Regeln:
 - Sage explizit, was aus dem Code sicher sichtbar ist.
 - Wenn du etwas nur aus Mustern ableitest, kuendige es mit "Meine Vermutung ist" an.
 - Vermeide konkrete Behauptungen ueber Laufzeitverhalten, wenn es dafuer in den Eingaben keinen klaren Beleg gibt.
+""".strip()
+
+
+def format_deep_dive_prompt(index: dict[str, Any], topic_context: dict[str, Any]) -> str:
+    selected_files_text = "\n\n".join(
+        (
+            f"[{item['file']}]"
+            f"\nRolle: {item['role']} | Komponente: {item['component']} | Score: {item['score']}"
+            f"\nGruende: {', '.join(item['reasons']) or 'kein besonderer Grund'}"
+            f"\nNutzt intern: {', '.join(item['imports_out']) or 'keine klaren internen Ziele erkannt'}"
+            f"\nWird genutzt von: {', '.join(item['imports_in']) or 'keine klaren internen Aufrufer erkannt'}"
+            f"\nSnippet:\n{item['snippet']}"
+        )
+        for item in topic_context["selected_files"]
+    ) or "[keine eindeutigen thematischen Dateien gefunden]"
+
+    matched_components_text = "\n".join(
+        f"- {item['name']} ({item['count']} Dateien, Score {item['score']})"
+        for item in topic_context["matched_components"]
+    ) or "- Keine klaren Komponenten-Matches"
+
+    matched_directories_text = "\n".join(
+        f"- {item['name']} (Score {item['score']})"
+        for item in topic_context["matched_directories"]
+    ) or "- Keine klaren Verzeichnis-Matches"
+
+    relationships_text = "\n".join(
+        f"- {item['from']} -> {item['to']} ({item['count']} Verbindungen)"
+        for item in topic_context["related_relationships"]
+    ) or "- Keine klaren thematischen Komponenten-Beziehungen"
+
+    config_text = "\n\n".join(
+        f"[{item['file']}]\n{item['snippet']}"
+        for item in topic_context["related_configs"]
+    ) or "[keine thematisch passenden Konfigurationen gefunden]"
+
+    entrypoint_text = "\n".join(
+        f"- {item['entrypoint']} -> {', '.join(item['touches']) or 'keine internen Ziele erkannt'}"
+        for item in topic_context["matched_entrypoints"]
+    ) or "- Keine direkt passenden Entrypoints erkannt"
+
+    return f"""
+Du bist ein erfahrener Staff Engineer und erklaerst einem Entwickler ein bestimmtes Thema innerhalb eines Repositories als deutsche Audio-Zusammenfassung.
+
+Ziel:
+- liefere einen echten Deep Dive zum Thema "{topic_context['topic']}"
+- erkläre zuerst den fachlichen und technischen Kern des Themas im Repo
+- zeige dann die wichtigsten Dateien, Datenfluesse, Abhaengigkeiten und Verantwortlichkeiten
+- ordne ein, welche Teile zentral sind und welche nur angrenzen
+- nenne sichere Beobachtungen zuerst und trenne Vermutungen klar als Vermutung
+- erklaere nicht nur Dateilisten, sondern baue ein mentales Modell fuer das Thema
+- nenne am Ende die besten naechsten Dateien oder Teilbereiche fuer weiteres Verstaendnis
+- klinge natuerlich, gesprochensprachlich und ohne Markdown oder Aufzaehlungszeichen
+- beginne mit "Hier ist dein Deep Dive zum Thema {topic_context['topic']}."
+- ende mit einem klaren Fazit und den naechsten sinnvollen Verstehensschritten
+- Umfang: etwa 700 bis 1100 Woerter
+
+Repo-Metadaten:
+- Branch: {index["git"]["branch"]}
+- HEAD: {index["git"]["head_sha"]}
+- Gesamtdateien: {index["total_files"]}
+- Projektform: {" ".join(index.get("project_shape", []))}
+
+Thema:
+- Wunschthema: {topic_context['topic']}
+- Extrahierte Suchbegriffe: {", ".join(topic_context["terms"]) or "keine stabilen Suchbegriffe"}
+- Abdeckung der automatischen Themenfindung: {topic_context['coverage']}
+
+Passende Komponenten:
+{matched_components_text}
+
+Passende Verzeichnisse:
+{matched_directories_text}
+
+Passende Komponenten-Beziehungen:
+{relationships_text}
+
+Passende Entrypoints:
+{entrypoint_text}
+
+Passende Konfigurationen:
+{shorten(config_text, 3200)}
+
+Wichtigste thematische Dateien:
+{shorten(selected_files_text, 9000)}
+
+Ausgabe-Regeln:
+- Sage explizit, was aus Code, Imports, Dateinamen und Konfigurationen sicher sichtbar ist.
+- Wenn du etwas nur aus Mustern ableitest, kuendige es mit "Meine Vermutung ist" an.
+- Wenn die thematische Abdeckung schwach ist, sage das offen und leite vorsichtig aus angrenzenden Dateien ab.
+- Vermeide erfundene Runtime-Details, wenn es dafuer in den Eingaben keinen klaren Beleg gibt.
 """.strip()
 
 
@@ -1288,6 +1671,53 @@ async def run_full_summary(config: Config, runner: ModelRunner, recorder: RunRec
     return result
 
 
+async def run_deep_dive_summary(
+    config: Config,
+    runner: ModelRunner,
+    recorder: RunRecorder,
+    *,
+    topic: str,
+) -> dict[str, Any]:
+    if not topic.strip():
+        raise SummaryError("Deep-dive mode requires a topic. Example: bash run_summary.sh deep auftragsfortschreibung")
+
+    index, cache_used = load_or_build_repo_index(config)
+    topic_context = collect_topic_context(config, index, topic)
+    prompt = format_deep_dive_prompt(index, topic_context)
+    summary, model_used = runner.generate(prompt, max_tokens=2200, timeout=420, purpose="deep_dive")
+    caption = (
+        f"Deep Dive {datetime.now().strftime('%d.%m.%Y')}\n"
+        f"Thema: {topic}"
+    )
+    result = {
+        "topic": topic,
+        "model": model_used,
+        "cache_used": cache_used,
+        "coverage": topic_context["coverage"],
+        "matched_files": [item["file"] for item in topic_context["selected_files"]],
+        "matched_components": [item["name"] for item in topic_context["matched_components"]],
+        "summary_preview": summary[:500],
+    }
+    await render_and_send_audio(
+        config,
+        recorder,
+        summary_key="deep_dive_delivery",
+        summary_text=summary,
+        file_prefix=f"deepdive_{sanitize_topic_slug(topic)}",
+        caption=caption,
+        metadata={
+            "mode": "deep",
+            "topic": topic,
+            "model": model_used,
+            "cache_used": cache_used,
+            "run_kind": os.environ.get("GAS_RUN_KIND", "manual"),
+            "coverage": topic_context["coverage"],
+        },
+    )
+    recorder.set_result("deep_dive", result)
+    return result
+
+
 def module_status(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
@@ -1400,7 +1830,10 @@ async def main() -> int:
     config = Config.from_env()
     ensure_runtime_directories(config)
     mode = sys.argv[1].lower() if len(sys.argv) > 1 else "both"
+    topic = resolve_deep_dive_topic(sys.argv[2:])
     recorder = RunRecorder(mode, config)
+    if topic:
+        recorder.set_result("requested_topic", topic)
 
     try:
         if mode == "doctor":
@@ -1414,11 +1847,13 @@ async def main() -> int:
             await run_daily_summary(config, runner, recorder)
         elif mode in {"full", "architecture", "arch", "full-repo"}:
             await run_full_summary(config, runner, recorder)
+        elif mode in {"deep", "deep-dive", "topic", "thema"}:
+            await run_deep_dive_summary(config, runner, recorder, topic=topic)
         elif mode == "both":
             await run_daily_summary(config, runner, recorder)
             await run_full_summary(config, runner, recorder)
         else:
-            raise SummaryError(f"Unknown mode: {mode}. Use daily, full, both, or doctor.")
+            raise SummaryError(f"Unknown mode: {mode}. Use daily, full, deep, both, or doctor.")
         recorder.finalize("success")
         return 0
     except Exception as exc:

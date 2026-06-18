@@ -111,6 +111,27 @@ class RepoAudioSummaryTests(unittest.TestCase):
         self.assertFalse(cache_used1)
         self.assertTrue(cache_used2)
 
+    def test_collect_topic_context_prefers_matching_files(self) -> None:
+        index = MODULE.build_repo_index(self.config)
+
+        topic_context = MODULE.collect_topic_context(self.config, index, "api client")
+
+        matched_files = [item["file"] for item in topic_context["selected_files"]]
+        self.assertIn("src/api/client.ts", matched_files)
+        self.assertEqual(topic_context["coverage"], "stark")
+
+    def test_resolve_deep_dive_topic_prefers_cli_and_falls_back_to_env(self) -> None:
+        original = MODULE.os.environ.get("DEEP_DIVE_TOPIC")
+        try:
+            MODULE.os.environ["DEEP_DIVE_TOPIC"] = "env topic"
+            self.assertEqual(MODULE.resolve_deep_dive_topic(["cli", "topic"]), "cli topic")
+            self.assertEqual(MODULE.resolve_deep_dive_topic([]), "env topic")
+        finally:
+            if original is None:
+                MODULE.os.environ.pop("DEEP_DIVE_TOPIC", None)
+            else:
+                MODULE.os.environ["DEEP_DIVE_TOPIC"] = original
+
 
 if __name__ == "__main__":
     unittest.main()

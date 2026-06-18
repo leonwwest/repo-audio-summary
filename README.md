@@ -7,6 +7,8 @@ Every evening the system can send two Telegram audio messages:
 1. A daily change summary for the last 24 hours
 2. A full architecture summary for the whole repository
 
+Additionally, you can trigger a topic-specific deep-dive audio on demand.
+
 The runtime is designed to stay local:
 
 - Ollama for the LLM
@@ -22,7 +24,7 @@ The runtime is designed to stay local:
 - Automatic model fallback chain
 - Retries and fallback text delivery for Telegram failures
 - Local `.txt` transcript archive for every generated summary
-- A committed `run_summary.sh` wrapper with `daily`, `full`, `both`, and `doctor`
+- A committed `run_summary.sh` wrapper with `daily`, `full`, `deep`, `both`, and `doctor`
 - Separate login catch-up handling if the Mac slept through the scheduled run
 - JSON status files plus dedicated stdout and stderr logs per run
 - Fixture-based tests for repo indexing, cache reuse, and change prioritization
@@ -80,10 +82,30 @@ Supported modes:
 
 - `bash run_summary.sh daily`
 - `bash run_summary.sh full`
+- `bash run_summary.sh deep "auftragsfortschreibung"`
 - `bash run_summary.sh both`
 - `bash run_summary.sh doctor`
 
 The wrapper also supports an internal `catchup-check` mode used by the login LaunchAgent.
+
+## Deep Dive mode
+
+Use the deep-dive mode when you want a focused audio walkthrough for one topic instead of a whole-repo summary.
+
+Example:
+
+```bash
+bash run_summary.sh deep "config loader"
+```
+
+The topic can be a component name, file family, workflow, domain concept, or technical concern, for example:
+
+- `bash run_summary.sh deep "auftragsfortschreibung"`
+- `bash run_summary.sh deep "telegram delivery"`
+- `bash run_summary.sh deep "config loader"`
+- `bash run_summary.sh deep "tests"`
+
+The generated transcript stores the requested topic in its metadata and the audio filename is prefixed with `deepdive_...`.
 
 ## Configuration
 

@@ -4,7 +4,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+        PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+    else
+        PYTHON_BIN="python3"
+    fi
+fi
 
 if [[ ! -f "${ENV_FILE}" ]]; then
     echo "Missing ${ENV_FILE}. Run bash setup.sh first."
@@ -27,6 +34,10 @@ OLLAMA_START_TIMEOUT="${OLLAMA_START_TIMEOUT:-30}"
 mkdir -p "${OUTPUT_DIR}" "${TEXT_OUTPUT_DIR}" "${CACHE_DIR}" "${LOG_DIR}" "${STATUS_DIR}"
 
 MODE="${1:-both}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+MODE_ARGS=("$@")
 STATE_FILE="${CACHE_DIR}/run_state.json"
 
 python_now() {
@@ -112,6 +123,8 @@ ensure_ollama_running() {
 run_mode() {
     local mode="$1"
     local run_kind="$2"
+    shift 2
+    local extra_args=("$@")
     local run_id
     local stdout_file
     local stderr_file
@@ -128,7 +141,7 @@ run_mode() {
 
     echo "Running mode=${mode} kind=${run_kind}"
     GAS_STATUS_FILE="${status_file}" GAS_RUN_KIND="${run_kind}" \
-        "${PYTHON_BIN}" "${SCRIPT_DIR}/repo_audio_summary.py" "${mode}" \
+        "${PYTHON_BIN}" "${SCRIPT_DIR}/repo_audio_summary.py" "${mode}" "${extra_args[@]}" \
         >>"${stdout_file}" 2>>"${stderr_file}"
 
     python_now write_state "${STATE_FILE}" "${mode}" "${run_kind}"
@@ -139,7 +152,7 @@ run_mode() {
 }
 
 maybe_run_catchup() {
-    if [[ "${MODE}" == "doctor" || "${MODE}" == "catchup-check" ]]; then
+    if [[ "${MODE}" != "daily" && "${MODE}" != "full" && "${MODE}" != "both" ]]; then
         return 1
     fi
 
@@ -171,9 +184,12 @@ case "${MODE}" in
         fi
         run_mode "${MODE}" "manual"
         ;;
+    deep|deep-dive|topic|thema)
+        run_mode "${MODE}" "manual" "${MODE_ARGS[@]}"
+        ;;
     *)
         echo "Unknown mode: ${MODE}"
-        echo "Use: daily | full | both | doctor"
+        echo "Use: daily | full | deep <topic> | both | doctor"
         exit 1
         ;;
 esac
