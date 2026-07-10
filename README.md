@@ -56,20 +56,6 @@ bash setup.sh
 - run `doctor` at the end
 - optionally run an immediate smoke test
 
-## Windows prep before moving to the Mac
-
-If you are still on Windows and only want to prepare the handoff, use these files:
-
-- [WINDOWS_PREP.md](/path/to/git-audio-summary/WINDOWS_PREP.md)
-- [MAC_HANDOFF_TEMPLATE.md](/path/to/git-audio-summary/MAC_HANDOFF_TEMPLATE.md)
-- [windows_prep.ps1](/path/to/git-audio-summary/windows_prep.ps1)
-
-The PowerShell helper gives you a quick status view:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\windows_prep.ps1
-```
-
 ## Main entrypoint
 
 Use the committed wrapper:
@@ -183,3 +169,7 @@ Run with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+MIT
